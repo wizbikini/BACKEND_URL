@@ -18,45 +18,37 @@ const BACKEND_URL  = (process.env.BACKEND_URL  || `http://localhost:${port}`).re
 const INSTAGRAM_URL = process.env.INSTAGRAM_URL || 'https://instagram.com/Wiz_pharoah';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// ---------------- CORS (relaxed for Render) ----------------
-function isAllowedOrigin(origin) {
-  if (!origin) return true; // same-origin/curl
+// ---------------- CORS (Render-friendly) ----------------
+function allowCors(origin) {
+  if (!origin) return false; // curl/same-origin etc.
   try {
     const o = origin.replace(/\/$/, '');
     if (o === FRONTEND_URL) return true;
 
-    const host = new URL(o).host.toLowerCase();
-    // Allow Render-hosted frontends and custom subdomains under onrender.com
+    const host = new URL(o).host;
+    // Allow Render-hosted frontends and GitHub Codespaces (and localhost)
     if (host.endsWith('.onrender.com')) return true;
-    // Allow Codespaces while developing
     if (host.endsWith('.app.github.dev')) return true;
-    // Local dev
-    if (host === 'localhost:5173' || host === '127.0.0.1:5173') return true;
+    if (o === 'http://localhost:5173' || o === 'https://localhost:5173') return true;
   } catch (_) {}
   return false;
 }
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  const allowed = isAllowedOrigin(origin);
-
-  if (allowed) {
-    // Echo back the actual origin (credentials + wildcards are not compatible)
-    res.setHeader('Access-Control-Allow-Origin', origin || FRONTEND_URL);
+  if (allowCors(origin)) {
+    // Echo back the requesting origin (required by CORS)
+    res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   }
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(allowed ? 204 : 403);
-  }
-
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// tiny log so we can see CORS origin on the checkout call
+// Helpful CORS log on the payment route
 app.use((req, _res, next) => {
   if (req.path === '/api/create-checkout-session') {
     console.log('[CORS]', req.method, 'origin:', req.headers.origin);
@@ -77,7 +69,6 @@ app.use('/api/stripe/webhook', bodyParser.raw({ type: 'application/json' }));
 app.use(bodyParser.json());
 
 // ---------------- SQLite PATH (free-tier safe) ----------------
-// Default to a file inside the repo (works on Render Free). You may override with DB_PATH.
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, 'persist', 'votes.db');
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
@@ -86,13 +77,13 @@ db.pragma('journal_mode = WAL');
 console.log(`[DB] Using SQLite at: ${DB_PATH}`);
 
 // ---------------- Schema ----------------
-const SQL_CREATE_CANDIDATES = `CREATE TABLE IF NOT EXISTS candidates (
+db.exec(`CREATE TABLE IF NOT EXISTS candidates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
   tally INTEGER NOT NULL DEFAULT 0
-);`;
+);`);
 
-const SQL_CREATE_TRANSACTIONS = `CREATE TABLE IF NOT EXISTS transactions (
+db.exec(`CREATE TABLE IF NOT EXISTS transactions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT UNIQUE,
   candidate_id INTEGER NOT NULL,
@@ -102,17 +93,13 @@ const SQL_CREATE_TRANSACTIONS = `CREATE TABLE IF NOT EXISTS transactions (
   paid INTEGER NOT NULL DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(candidate_id) REFERENCES candidates(id)
-);`;
+);`);
 
-const SQL_CREATE_SETTINGS = `CREATE TABLE IF NOT EXISTS settings (
+db.exec(`CREATE TABLE IF NOT EXISTS settings (
   id INTEGER PRIMARY KEY,
   question TEXT,
   glow TEXT
-);`;
-
-db.exec(SQL_CREATE_CANDIDATES);
-db.exec(SQL_CREATE_TRANSACTIONS);
-db.exec(SQL_CREATE_SETTINGS);
+);`);
 
 // seed
 db.prepare('INSERT OR IGNORE INTO settings (id, question, glow) VALUES (1, ?, ?)').run("Is this week's answer YES?", '#00ffff');
@@ -203,47 +190,4 @@ app.get('/api/verify-session', async (req,res)=>{
 
     const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(session_id);
     if (!trx) return res.status(404).json({ error:'Unknown session' });
-    if (trx.paid) return res.json({ ok:true, alreadyCounted:true });
-    if (!stripe) return res.status(400).json({ error:'Stripe not configured' });
-
-    const session = await stripe.checkout.sessions.retrieve(String(session_id));
-    if (session.payment_status === 'paid') {
-      const mark = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
-      const inc  = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
-      const tx   = db.transaction(()=>{ mark.run(String(session_id)); inc.run(trx.votes, trx.candidate_id); });
-      tx();
-      return res.json({ ok:true, counted:true });
-    }
-    res.json({ ok:false, paid:false });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error:'Verification failed' });
-  }
-});
-
-// ------------- Webhook (optional) -------------
-app.post('/api/stripe/webhook', (req,res)=>{
-  const sig = req.headers['stripe-signature'];
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret || !stripe) return res.json({ received:true, note:'webhook not configured' });
-
-  try {
-    const event = stripe.webhooks.constructEvent(req.body, sig, secret);
-    if (event.type === 'checkout.session.completed') {
-      const { id } = event.data.object;
-      const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(id);
-      if (trx && !trx.paid) {
-        const mark = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
-        const inc  = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
-        const tx   = db.transaction(()=>{ mark.run(id); inc.run(trx.votes, trx.candidate_id); });
-        tx();
-      }
-    }
-  } catch (e) {
-    console.error('Webhook error:', e.message);
-    return res.status(400).send(`Webhook Error: ${e.message}`);
-  }
-  res.json({ received:true });
-});
-
-app.listen(port, ()=>console.log(`Backend running on ${BACKEND_URL}`));
+    if (trx.paid) return res.json({ ok:true
