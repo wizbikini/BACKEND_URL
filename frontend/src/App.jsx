@@ -32,15 +32,28 @@ function neonStyle(color) {
   };
 }
 
+/* ---------- helpers for resilient fetch (Render free-tier wakeup) ---------- */
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+async function fetchJSONRetry(url, options = {}, tries = 12, delay = 2500) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, options);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      lastErr = e;
+      await sleep(delay); // give the backend time to wake
+    }
+  }
+  throw lastErr;
+}
+
 /* ----------------------------- debug: show URL ----------------------------- */
-// This runs in the module (OK to use import.meta here). It exposes the value
-// in DevTools without needing `import.meta` in the console (which would error).
 if (typeof window !== 'undefined') {
-  // Don’t clobber if the page already set a custom value:
   if (!window.__BACKEND_URL && typeof import.meta !== 'undefined' && import.meta.env?.VITE_BACKEND_URL) {
     window.__BACKEND_URL = import.meta.env.VITE_BACKEND_URL;
   }
-  // Log once on load
   // eslint-disable-next-line no-console
   console.log('[frontend] VITE_BACKEND_URL =', window.__BACKEND_URL || '(unset)');
 }
@@ -66,25 +79,28 @@ export default function App() {
     []
   );
 
-  // initial load + poll tally
+  // initial load + poll tally (retry-aware)
   useEffect(() => {
     let cancelled = false;
 
     const init = async () => {
+      setLoading(true);
+      setMessage('Waking the backend… (free plan can take ~30–60s)');
       try {
-        const s = await fetch(`${BACKEND}/api/settings`).then(r => r.json());
+        const s = await fetchJSONRetry(`${BACKEND}/api/settings`);
         if (cancelled) return;
         setQuestion(s.question || '');
         setGlow(s.glow || '#00ffff');
         setInstagram(s.instagram || 'https://instagram.com');
 
-        const t = await fetch(`${BACKEND}/api/tally`).then(r => r.json());
+        const t = await fetchJSONRetry(`${BACKEND}/api/tally`);
         if (cancelled) return;
         setTally(t.tally || []);
+        setMessage('');
       } catch (e) {
         // eslint-disable-next-line no-console
         console.error('[frontend] settings/tally fetch failed:', e);
-        setMessage('Cannot reach backend. Check VITE_BACKEND_URL and server.');
+        if (!cancelled) setMessage('Cannot reach backend. Check VITE_BACKEND_URL and server.');
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -95,9 +111,7 @@ export default function App() {
       try {
         const t = await fetch(`${BACKEND}/api/tally`).then(r => r.json());
         if (!cancelled) setTally(t.tally || []);
-      } catch {
-        /* swallow polling errors */
-      }
+      } catch {/* swallow polling errors */}
     }, 3000);
 
     return () => {
@@ -105,6 +119,14 @@ export default function App() {
       clearInterval(iv);
     };
   }, [BACKEND]);
+
+  // optional: auto-pick "YES" on first load if nothing selected yet
+  useEffect(() => {
+    if (!choiceId && tally?.length) {
+      const yes = tally.find(x => String(x.name).toLowerCase() === 'yes') ?? tally[0];
+      if (yes) setChoiceId(yes.id);
+    }
+  }, [tally, choiceId]);
 
   // post-checkout verify
   useEffect(() => {
@@ -283,7 +305,7 @@ export default function App() {
         </div>
 
         <div className="mt-12 max-w-xl mx-auto">
-          <h3 className="text-lg font-semibold mb-3">Live Tally</h3>
+          <h3 className="text-lg font-semibold mb-3" style={neonStyle(glow)}>Live Tally</h3>
           <ul className="space-y-2">
             {tally.map((t) => (
               <li
