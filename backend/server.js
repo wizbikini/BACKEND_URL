@@ -18,29 +18,41 @@ const BACKEND_URL  = (process.env.BACKEND_URL  || `http://localhost:${port}`).re
 const INSTAGRAM_URL = process.env.INSTAGRAM_URL || 'https://instagram.com/Wiz_pharoah';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// ---------------- CORS ----------------
+// ---------------- CORS (relaxed for Render) ----------------
 function isAllowedOrigin(origin) {
   if (!origin) return true; // same-origin/curl
   try {
     const o = origin.replace(/\/$/, '');
     if (o === FRONTEND_URL) return true;
-    const host = new URL(o).host;
-    if (host.endsWith('.app.github.dev')) return true; // Codespaces
-    if (o === 'http://localhost:5173' || o === 'https://localhost:5173') return true;
+
+    const host = new URL(o).host.toLowerCase();
+    // Allow Render-hosted frontends and custom subdomains under onrender.com
+    if (host.endsWith('.onrender.com')) return true;
+    // Allow Codespaces while developing
+    if (host.endsWith('.app.github.dev')) return true;
+    // Local dev
+    if (host === 'localhost:5173' || host === '127.0.0.1:5173') return true;
   } catch (_) {}
   return false;
 }
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (isAllowedOrigin(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  const allowed = isAllowedOrigin(origin);
+
+  if (allowed) {
+    // Echo back the actual origin (credentials + wildcards are not compatible)
+    res.setHeader('Access-Control-Allow-Origin', origin || FRONTEND_URL);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   }
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(allowed ? 204 : 403);
+  }
+
   next();
 });
 
