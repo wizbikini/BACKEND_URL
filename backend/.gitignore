@@ -1,12 +1,16 @@
-node_modules
+# backend/.gitignore
+node_modules/
 .env
-votes.db
+
+# local db and folder
 persist/
+votes.db
+
+# any sqlite files anywhere under backend/
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
-
 
