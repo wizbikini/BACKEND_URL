@@ -1,0 +1,135 @@
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const dotenv = require('dotenv');
+const Stripe = require('stripe');
+const Database = require('better-sqlite3');
+
+dotenv.config();
+const app = express();
+const port = process.env.PORT || 8787;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${port}`;
+const INSTAGRAM_URL = process.env.INSTAGRAM_URL || 'https://instagram.com/yourhandle';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+
+function requireEnv(name) { const val = process.env[name]; if (!val || !String(val).trim()) console.warn(`[ENV] Missing ${name}.`); return val; }
+const stripeSecret = requireEnv('STRIPE_SECRET_KEY');
+let stripe = null;
+if (stripeSecret) { try { stripe = new Stripe(stripeSecret, { apiVersion: '2024-06-20' }); } catch (e) { console.error('Stripe init failed:', e.message); } }
+
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+app.use('/api/stripe/webhook', bodyParser.raw({ type: 'application/json' }));
+app.use(bodyParser.json());
+
+// ---- DB ----
+const db = new Database('votes.db');
+db.pragma('journal_mode = WAL');
+
+db.exec(`CREATE TABLE IF NOT EXISTS candidates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  tally INTEGER NOT NULL DEFAULT 0
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT UNIQUE,
+  candidate_id INTEGER NOT NULL,
+  votes INTEGER NOT NULL,
+  currency TEXT NOT NULL,
+  amount_total INTEGER NOT NULL,
+  paid INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS settings (
+  id INTEGER PRIMARY KEY,
+  question TEXT,
+  glow TEXT
+)`);
+
+// seed
+db.prepare('INSERT OR IGNORE INTO settings (id, question, glow) VALUES (1, ?, ?)').run("Is this week's answer YES?", '#00ffff');
+if (db.prepare('SELECT COUNT(*) c FROM candidates').get().c === 0) {
+  const seeds = (process.env.CANDIDATES || 'Yes,No').split(',').map(s=>s.trim()).filter(Boolean);
+  const ins = db.prepare('INSERT INTO candidates (name) VALUES (?)');
+  const tx = db.transaction(ns => { for (const n of ns) ins.run(n); });
+  tx(seeds);
+}
+// helpers
+function calcAmountMinor({ votes }) { const base = Number(process.env.VOTE_PRICE_MINOR || 100); return base * votes; }
+
+// ---- routes ----
+app.get('/', (req,res)=>res.send('Backend up ✅ — try /api/health, /api/settings, /api/tally'));
+app.get('/api/health', (req,res)=>res.json({ ok:true }));
+app.get('/api/settings', (req,res)=>{ const s = db.prepare('SELECT question, glow FROM settings WHERE id=1').get(); res.json({ question: s?.question || '', glow: s?.glow || '#00ffff', instagram: INSTAGRAM_URL }); });
+app.get('/api/candidates', (req,res)=>{ const data = db.prepare('SELECT id,name,tally FROM candidates ORDER BY id ASC').all(); res.json({ candidates: data, instagram: INSTAGRAM_URL }); });
+app.get('/api/tally', (req,res)=>{ const data = db.prepare('SELECT id,name,tally FROM candidates ORDER BY id ASC').all(); res.json({ tally: data }); });
+// admin
+app.post('/api/admin/settings', (req,res)=>{
+  const auth = req.headers.authorization || '';
+  if (!ADMIN_TOKEN || auth !== `Bearer ${ADMIN_TOKEN}`) return res.status(401).json({ error:'Unauthorized' });
+  const { question, glow } = req.body || {};
+  db.prepare('UPDATE settings SET question=COALESCE(?,question), glow=COALESCE(?,glow) WHERE id=1').run(question, glow);
+  res.json({ ok:true });
+});
+// payments
+app.post('/api/create-checkout-session', async (req,res)=>{
+  try {
+    const { candidateId, votes = 1, currency = 'USD', successUrl, cancelUrl } = req.body || {};
+    if (!stripe) return res.status(400).json({ error: 'Stripe is not configured on the server.' });
+    const candidate = db.prepare('SELECT * FROM candidates WHERE id=?').get(candidateId);
+    if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
+    const amountMinor = calcAmountMinor({ votes });
+    const session = await stripe.checkout.sessions.create({
+      mode:'payment', currency,
+      line_items:[{ price_data:{ currency, product_data:{ name: `${candidate.name} — ${votes} vote${votes>1?'s':''}` }, unit_amount: amountMinor }, quantity:1 }],
+      success_url: successUrl || `${FRONTEND_URL}/?status=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl || `${FRONTEND_URL}/?status=cancelled`,
+      allow_promotion_codes:false,
+      metadata:{ candidate_id:String(candidate.id), votes:String(votes) }
+    });
+    db.prepare('INSERT INTO transactions (session_id, candidate_id, votes, currency, amount_total, paid) VALUES (?,?,?,?,?,0)')
+      .run(session.id, candidate.id, votes, currency, amountMinor);
+    res.json({ id: session.id, url: session.url });
+  } catch (err) { console.error(err); res.status(500).json({ error:'Failed to create checkout session' }); }
+});
+
+app.get('/api/verify-session', async (req,res)=>{
+  try {
+    const { session_id } = req.query || {}; if (!session_id) return res.status(400).json({ error:'Missing session_id' });
+    const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(session_id);
+    if (!trx) return res.status(404).json({ error:'Unknown session' });
+    if (trx.paid) return res.json({ ok:true, alreadyCounted:true });
+    if (!stripe) return res.status(400).json({ error:'Stripe not configured' });
+    const session = await stripe.checkout.sessions.retrieve(String(session_id));
+    if (session.payment_status==='paid') {
+      const update = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
+      const inc = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
+      const tx = db.transaction(()=>{ update.run(String(session_id)); inc.run(trx.votes, trx.candidate_id); });
+      tx();
+      return res.json({ ok:true, counted:true });
+    }
+    return res.json({ ok:false, paid:false });
+  } catch (err) { console.error(err); res.status(500).json({ error:'Verification failed' }); }
+});
+// webhook (optional)
+app.post('/api/stripe/webhook', (req,res)=>{
+  const sig = req.headers['stripe-signature'];
+  const secret = process.env.STRIPE_WEBHOOK_SECRET; if (!secret) return res.json({ received:true, warning:'No webhook secret set' });
+  let event; try { event = stripe.webhooks.constructEvent(req.body, sig, secret); } catch (e) { console.error('Webhook signature verification failed', e.message); return res.status(400).send(`Webhook Error: ${e.message}`); }
+  if (event.type==='checkout.session.completed') {
+    const session = event.data.object; const id = session.id;
+    try {
+      const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(id);
+      if (trx && !trx.paid) {
+        const update = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
+        const inc = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
+        const tx = db.transaction(()=>{ update.run(id); inc.run(trx.votes, trx.candidate_id); });
+        tx();
+      }
+    } catch (e) { console.error('Webhook handling error:', e); }
+  }
+  res.json({ received:true });
+});
+app.listen(port, ()=>console.log(`Backend running on ${BACKEND_URL}`));
