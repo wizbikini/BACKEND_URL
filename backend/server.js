@@ -190,4 +190,47 @@ app.get('/api/verify-session', async (req,res)=>{
 
     const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(session_id);
     if (!trx) return res.status(404).json({ error:'Unknown session' });
-    if (trx.paid) return res.json({ ok:true
+    if (trx.paid) return res.json({ ok:true, alreadyCounted:true });
+    if (!stripe) return res.status(400).json({ error:'Stripe not configured' });
+
+    const session = await stripe.checkout.sessions.retrieve(String(session_id));
+    if (session.payment_status === 'paid') {
+      const mark = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
+      const inc  = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
+      const tx   = db.transaction(()=>{ mark.run(String(session_id)); inc.run(trx.votes, trx.candidate_id); });
+      tx();
+      return res.json({ ok:true, counted:true });
+    }
+    res.json({ ok:false, paid:false });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error:'Verification failed' });
+  }
+});
+
+// ------------- Webhook (optional) -------------
+app.post('/api/stripe/webhook', (req,res)=>{
+  const sig = req.headers['stripe-signature'];
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret || !stripe) return res.json({ received:true, note:'webhook not configured' });
+
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, sig, secret);
+    if (event.type === 'checkout.session.completed') {
+      const { id } = event.data.object;
+      const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(id);
+      if (trx && !trx.paid) {
+        const mark = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
+        const inc  = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
+        const tx   = db.transaction(()=>{ mark.run(id); inc.run(trx.votes, trx.candidate_id); });
+        tx();
+      }
+    }
+  } catch (e) {
+    console.error('Webhook error:', e.message);
+    return res.status(400).send(`Webhook Error: ${e.message}`);
+  }
+  res.json({ received:true });
+});
+
+app.listen(port, ()=>console.log(`Backend running on ${BACKEND_URL}`));
