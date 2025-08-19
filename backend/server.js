@@ -66,20 +66,17 @@ app.use('/api/stripe/webhook', bodyParser.raw({ type: 'application/json' }));
 // Normal JSON for the rest
 app.use(bodyParser.json());
 
-// ---------------- SQLite PERSISTENT PATH ----------------
-// Use a persistent disk path if provided (e.g., Render/Railway mount /data).
-// Fallback to local file under backend/.
-const DB_PATH =
-  process.env.DB_PATH ||
-  (process.env.RENDER ? '/data/votes.db' : path.resolve(__dirname, 'votes.db'));
-
-// Ensure parent directory exists (sqlite fails if dir missing)
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+// ---------------- SQLite PATH (FREE PLAN-FRIENDLY) ----------------
+// Default to a local folder inside backend/ so it works on free Render.
+// If you later add a persistent disk, just set DB_PATH=/data/votes.db.
+const DATA_DIR = process.env.DB_DIR || path.join(__dirname, 'persist');
+const DB_PATH  = process.env.DB_PATH || path.join(DATA_DIR, 'votes.db');
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 console.log(`[DB] Using SQLite at: ${DB_PATH}`);
-// --------------------------------------------------------
+// ------------------------------------------------------------------
 
 // Schema
 const SQL_CREATE_CANDIDATES = `CREATE TABLE IF NOT EXISTS candidates (
@@ -98,147 +95,4 @@ const SQL_CREATE_TRANSACTIONS = `CREATE TABLE IF NOT EXISTS transactions (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(candidate_id) REFERENCES candidates(id)
 )`;
-const SQL_CREATE_SETTINGS = `CREATE TABLE IF NOT EXISTS settings (
-  id INTEGER PRIMARY KEY,
-  question TEXT,
-  glow TEXT
-)`;
-
-db.exec(SQL_CREATE_CANDIDATES);
-db.exec(SQL_CREATE_TRANSACTIONS);
-db.exec(SQL_CREATE_SETTINGS);
-
-// seed
-db.prepare('INSERT OR IGNORE INTO settings (id, question, glow) VALUES (1, ?, ?)').run("Is this week's answer YES?", '#00ffff');
-if (db.prepare('SELECT COUNT(*) AS c FROM candidates').get().c === 0) {
-  const seeds = (process.env.CANDIDATES || 'Yes,No').split(',').map(s=>s.trim()).filter(Boolean);
-  const ins = db.prepare('INSERT INTO candidates (name) VALUES (?)');
-  const tx = db.transaction(arr => { for (const n of arr) ins.run(n); });
-  tx(seeds);
-}
-
-function priceMinor(votes){
-  const base = Number(process.env.VOTE_PRICE_MINOR || 100); // 100 = $1.00
-  return base * Math.max(1, Number(votes||1));
-}
-
-// basic routes
-app.get('/', (req,res)=>res.send('Backend up ✅ — try /api/health, /api/settings, /api/tally'));
-app.get('/api/health', (req,res)=>res.json({ ok:true }));
-app.get('/api/settings', (req,res)=>{
-  const s = db.prepare('SELECT question, glow FROM settings WHERE id=1').get();
-  res.json({ question: s?.question||'', glow: s?.glow||'#00ffff', instagram: INSTAGRAM_URL });
-});
-app.get('/api/tally', (req,res)=>{
-  const rows = db.prepare('SELECT id,name,tally FROM candidates ORDER BY id ASC').all();
-  res.json({ tally: rows });
-});
-
-app.post('/api/admin/settings', (req,res)=>{
-  const auth = req.headers.authorization || '';
-  if (!ADMIN_TOKEN || auth !== `Bearer ${ADMIN_TOKEN}`)
-    return res.status(401).json({ error:'Unauthorized' });
-  const { question, glow } = req.body || {};
-  db.prepare('UPDATE settings SET question=COALESCE(?,question), glow=COALESCE(?,glow) WHERE id=1')
-    .run(question, glow);
-  res.json({ ok:true });
-});
-
-// create checkout (with tiny safety tweak)
-app.post('/api/create-checkout-session', async (req,res)=>{
-  try {
-    // ---- small code tweak: normalize inputs ----
-    const candidateId = Number(req.body?.candidateId);
-    const votesRaw = Number.parseInt(req.body?.votes, 10);
-    const votes = Number.isFinite(votesRaw) && votesRaw > 0 ? votesRaw : 1;
-    const currency = String(req.body?.currency || 'USD').toUpperCase();
-    const successUrl = req.body?.successUrl || `${FRONTEND_URL}/?status=success&session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl  = req.body?.cancelUrl  || `${FRONTEND_URL}/?status=cancelled`;
-
-    if (!stripe) return res.status(400).json({ error:'Stripe is not configured on the server.' });
-    if (!Number.isFinite(candidateId)) return res.status(400).json({ error:'Invalid candidateId' });
-
-    const cand = db.prepare('SELECT * FROM candidates WHERE id=?').get(candidateId);
-    if (!cand) return res.status(404).json({ error:'Candidate not found' });
-
-    const amount = priceMinor(votes);
-    const session = await stripe.checkout.sessions.create({
-      mode:'payment',
-      currency,
-      line_items:[{
-        price_data:{
-          currency,
-          product_data:{ name:`${cand.name} — ${votes} vote${votes>1?'s':''}` },
-          unit_amount: amount
-        },
-        quantity:1
-      }],
-      success_url: successUrl,
-      cancel_url:  cancelUrl,
-      allow_promotion_codes:false,
-      metadata:{ candidate_id:String(cand.id), votes:String(votes) }
-    });
-
-    db.prepare('INSERT INTO transactions (session_id, candidate_id, votes, currency, amount_total, paid) VALUES (?,?,?,?,?,0)')
-      .run(session.id, cand.id, votes, currency, amount);
-
-    res.json({ id: session.id, url: session.url });
-  } catch (e) {
-    console.error('Create session error:', e);
-    const msg = process.env.NODE_ENV === 'production' ? 'Failed to create checkout session' : `Failed to create checkout session: ${e.message}`;
-    res.status(500).json({ error: msg });
-  }
-});
-
-// verify after redirect
-app.get('/api/verify-session', async (req,res)=>{
-  try {
-    const { session_id } = req.query || {};
-    if (!session_id) return res.status(400).json({ error:'Missing session_id' });
-
-    const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(session_id);
-    if (!trx) return res.status(404).json({ error:'Unknown session' });
-    if (trx.paid) return res.json({ ok:true, alreadyCounted:true });
-    if (!stripe) return res.status(400).json({ error:'Stripe not configured' });
-
-    const session = await stripe.checkout.sessions.retrieve(String(session_id));
-    if (session.payment_status === 'paid') {
-      const mark = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
-      const inc  = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
-      const tx   = db.transaction(()=>{ mark.run(String(session_id)); inc.run(trx.votes, trx.candidate_id); });
-      tx();
-      return res.json({ ok:true, counted:true });
-    }
-    res.json({ ok:false, paid:false });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error:'Verification failed' });
-  }
-});
-
-// webhook (optional)
-app.post('/api/stripe/webhook', (req,res)=>{
-  const sig = req.headers['stripe-signature'];
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret || !stripe) return res.json({ received:true, note:'webhook not configured' });
-
-  try {
-    const event = stripe.webhooks.constructEvent(req.body, sig, secret);
-    if (event.type === 'checkout.session.completed') {
-      const { id } = event.data.object;
-      const trx = db.prepare('SELECT * FROM transactions WHERE session_id=?').get(id);
-      if (trx && !trx.paid) {
-        const mark = db.prepare('UPDATE transactions SET paid=1 WHERE session_id=?');
-        const inc  = db.prepare('UPDATE candidates SET tally=tally+? WHERE id=?');
-        const tx   = db.transaction(()=>{ mark.run(id); inc.run(trx.votes, trx.candidate_id); });
-        tx();
-      }
-    }
-  } catch (e) {
-    console.error('Webhook error:', e.message);
-    return res.status(400).send(`Webhook Error: ${e.message}`);
-  }
-  res.json({ received:true });
-});
-
-app.listen(port, ()=>console.log(`Backend running on ${BACKEND_URL}`));
+const SQL_CRE_
