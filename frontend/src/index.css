@@ -1,0 +1,28 @@
+/* Premium dark background + utilities */
+:root { --glow: #00fff0; }
+
+body { background: #0a0a0a; }
+
+.bg-grid {
+  background:
+    radial-gradient(1200px 400px at 10% -10%, rgba(0,255,240,.15), transparent 60%),
+    radial-gradient(800px 300px at 100% 10%, rgba(0,170,255,.10), transparent 60%),
+    radial-gradient(600px 600px at 50% 120%, rgba(0,255,160,.08), transparent 60%);
+}
+
+.neon-text {
+  color: #dffffc;
+  text-shadow: 0 0 12px var(--glow), 0 0 36px var(--glow);
+}
+
+.neon-ring {
+  box-shadow:
+    0 0 0 2px rgba(255,255,255,.10) inset,
+    0 0 18px rgba(0,255,240,.40),
+    0 0 70px rgba(0,255,240,.15);
+}
+
+.btn-neon { box-shadow: 0 8px 28px rgba(0,255,240,.12); transition: transform .15s ease, box-shadow .2s ease; }
+.btn-neon:hover { box-shadow: 0 12px 40px rgba(0,255,240,.24); transform: translateY(-1px) scale(1.02); }
+
+.card-glass { backdrop-filter: blur(10px); background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.10); }
